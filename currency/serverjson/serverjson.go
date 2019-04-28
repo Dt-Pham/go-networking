@@ -3,8 +3,11 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"time"
 
 	curr "github.com/go-networking/currency/lib"
 )
@@ -53,13 +56,35 @@ func main() {
 	log.Println("*** Global Currency Service ***")
 	log.Printf("Service started: (tcp) %s\n", addr)
 
+	tries := 0
+	delayTime := time.Millisecond * 10
+
 	// connection loop
 	for {
 		conn, err := lis.Accept()
+
 		if err != nil {
-			log.Println(err)
-			conn.Close()
-			continue
+			switch e := err.(type) {
+			case net.Error:
+				if e.Temporary() {
+					if tries > 5 {
+						conn.Close()
+						log.Fatalf("Can not establish connection after %d times: %v\n", tries, err)
+					}
+					tries++
+					delayTime *= 2
+					time.Sleep(delayTime)
+				} else {
+					conn.Close()
+					continue
+				}
+			default:
+				log.Println(err)
+				conn.Close()
+				continue
+			}
+			tries = 0
+			delayTime = time.Millisecond * 10
 		}
 		log.Println("Connected to", conn.RemoteAddr())
 		go handleConnection(conn)
@@ -73,23 +98,55 @@ func handleConnection(conn net.Conn) {
 		}
 	}()
 
-	// create json encoder/decoder using net.Conn as
-	// io.Writer and io.Reader for streaming IO
-	dec := json.NewDecoder(conn)
-	enc := json.NewEncoder(conn)
-
 	for {
-		var req curr.CurrencyRequest
-		if err := dec.Decode(&req); err != nil {
-			log.Println("failed to decode request:", err)
+		// set initial deadline prior to entering
+		// the client request/response loop to 45 seconds.
+		// This means that the client has 45 seconds to send
+		// its initial request or loose the connection.
+		if err := conn.SetDeadline(time.Now().Add(time.Second * 45)); err != nil {
+			log.Println("Failed to set deadline", err)
 			return
+		}
+
+		var req curr.CurrencyRequest
+		dec := json.NewDecoder(conn)
+		if err := dec.Decode(&req); err != nil {
+			switch err := err.(type) {
+			case net.Error:
+				if err.Timeout() {
+					log.Println("deadline reached, disconnecting...")
+					return
+				}
+				fmt.Println("network error:", err)
+			default:
+				if err == io.EOF {
+					log.Println("closing connection:", err)
+					return
+				}
+				enc := json.NewEncoder(conn)
+				if encerr := enc.Encode(&curr.CurrencyError{Error: err.Error()}); encerr != nil {
+					log.Println("Failed error encoding:", encerr)
+					return
+				}
+				continue
+			}
 		}
 
 		results := curr.Find(currencies, req.Get)
 
+		enc := json.NewEncoder(conn)
 		if err := enc.Encode(&results); err != nil {
-			log.Println("failed to encode data:", err)
-			return
+			switch err := err.(type) {
+			case net.Error:
+				log.Println("failed to send response:", err)
+				return
+			default:
+				if encerr := enc.Encode(&curr.CurrencyError{Error: err.Error()}); encerr != nil {
+					log.Println("failed to send error:", encerr)
+					return
+				}
+				continue
+			}
 		}
 	}
 }
